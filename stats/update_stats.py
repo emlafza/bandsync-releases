@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+"""Aggiorna le statistiche di download di BandSync.
+
+Legge le release via API GitHub (solo conteggio cumulativo per asset), accoda uno snapshot
+giornaliero in stats.json per ricostruire l'andamento nel tempo, poi rigenera index.html.
+Nessun server, nessun database: tutto versionato nel repo e pubblicato su GitHub Pages.
+"""
+import json
+import os
+import re
+import sys
+import urllib.request
+from datetime import date, datetime, timezone
+from pathlib import Path
+
+REPO = os.environ.get("STATS_REPO", "emlafza/bandsync-releases")
+HERE = Path(__file__).resolve().parent
+STATS = HERE / "stats.json"
+INDEX = HERE / "index.html"
+
+
+def fetch_releases():
+    url = f"https://api.github.com/repos/{REPO}/releases?per_page=100"
+    headers = {"User-Agent": "bandsync-stats", "Accept": "application/vnd.github+json"}
+    token = os.environ.get("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.load(r)
+
+
+def version_of(tag: str) -> str:
+    return re.sub(r"^v", "", tag)
+
+
+def collect(releases):
+    """Download cumulativi per versione (somma degli asset .apk della release)."""
+    per_version = {}
+    for rel in releases:
+        if rel.get("draft") or rel.get("prerelease"):
+            continue
+        apks = [a for a in rel.get("assets", []) if a["name"].lower().endswith(".apk")]
+        if not apks:
+            continue
+        per_version[version_of(rel["tag_name"])] = sum(a.get("download_count", 0) for a in apks)
+    return per_version
+
+
+def load_history():
+    if STATS.exists():
+        return json.loads(STATS.read_text())
+    return {"snapshots": []}
+
+
+def update_history(history, per_version):
+    today = date.today().isoformat()
+    total = sum(per_version.values())
+    snap = {"date": today, "total": total, "versions": per_version}
+    snaps = history["snapshots"]
+    # Una sola riga al giorno: sostituisce quella odierna se già presente
+    if snaps and snaps[-1]["date"] == today:
+        snaps[-1] = snap
+    else:
+        snaps.append(snap)
+    history["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return history
+
+
+def render_html(history):
+    data_json = json.dumps(history, ensure_ascii=False)
+    updated = history.get("updated_at", "")
+    return HTML_TEMPLATE.replace("/*DATA*/", data_json).replace("{{UPDATED}}", updated)
+
+
+HTML_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="robots" content="noindex" />
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%238b7cf6'/%3E%3Cg fill='%23ffffff'%3E%3Crect x='7' y='13' width='3' height='6' rx='1.5'/%3E%3Crect x='12' y='9' width='3' height='14' rx='1.5'/%3E%3Crect x='17' y='6' width='3' height='20' rx='1.5'/%3E%3Crect x='22' y='11' width='3' height='10' rx='1.5'/%3E%3C/g%3E%3C/svg%3E" />
+<title>BandSync · Statistiche download</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root{
+    --bg:#0f0f17; --bg2:#14141f; --panel:#1a1a28; --panel2:#20202f;
+    --line:#2a2a3e; --text:#eceaf2; --muted:#9a95a6;
+    --accent:#bb86fc; --accent2:#7c4dff; --teal:#03dac6; --pink:#ff6ec7; --amber:#ffb86c;
+    --shadow:0 10px 30px rgba(0,0,0,.35);
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{
+    font-family:'Inter',system-ui,sans-serif; color:var(--text);
+    background:
+      radial-gradient(1100px 500px at 15% -10%, rgba(124,77,255,.22), transparent 60%),
+      radial-gradient(900px 500px at 100% 0%, rgba(3,218,198,.10), transparent 55%),
+      var(--bg);
+    min-height:100vh;
+  }
+  .wrap{max-width:1040px;margin:0 auto;padding:28px 20px 48px}
+  header.top{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+  .logo{width:44px;height:44px;border-radius:13px;display:grid;place-items:center;
+    overflow:hidden;box-shadow:var(--shadow)}
+  .logo svg{width:100%;height:100%;display:block}
+  .title h1{margin:0;font-size:20px;font-weight:800;letter-spacing:.2px}
+  .title p{margin:2px 0 0;font-size:12.5px;color:var(--muted)}
+  .pill{margin-left:auto;background:rgba(187,134,252,.14);border:1px solid rgba(187,134,252,.3);
+    color:var(--accent);padding:7px 14px;border-radius:999px;font-weight:600;font-size:13px}
+
+  .grid{display:grid;gap:16px;margin-top:22px}
+  .cards{grid-template-columns:repeat(4,1fr)}
+  @media(max-width:720px){.cards{grid-template-columns:repeat(2,1fr)}}
+  .card{position:relative;overflow:hidden;background:linear-gradient(180deg,var(--panel2),var(--panel));
+    border:1px solid var(--line);border-radius:18px;padding:18px;box-shadow:var(--shadow)}
+  .card .ic{position:absolute;top:14px;right:14px;opacity:.9;font-size:18px}
+  .card .n{font-size:30px;font-weight:800;line-height:1;background:linear-gradient(90deg,#fff,var(--accent));
+    -webkit-background-clip:text;background-clip:text;color:transparent}
+  .card .l{margin-top:8px;font-size:12.5px;color:var(--muted)}
+  .card::after{content:"";position:absolute;left:0;bottom:0;height:3px;width:100%;
+    background:linear-gradient(90deg,var(--accent),transparent)}
+
+  .cols{grid-template-columns:1.4fr 1fr}
+  @media(max-width:860px){.cols{grid-template-columns:1fr}}
+  .panel{background:linear-gradient(180deg,var(--panel2),var(--panel));border:1px solid var(--line);
+    border-radius:18px;padding:18px 18px 10px;box-shadow:var(--shadow)}
+  .panel h2{margin:0 0 4px;font-size:14px;font-weight:700}
+  .panel .hint{margin:0 0 12px;font-size:12px;color:var(--muted)}
+  .chart-box{position:relative;height:230px}
+  .empty{height:230px;display:grid;place-items:center;text-align:center;color:var(--muted);font-size:13.5px;
+    border:1px dashed var(--line);border-radius:14px}
+
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  th,td{padding:10px 8px;border-bottom:1px solid var(--line);text-align:left}
+  th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.4px}
+  td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
+  .tag{display:inline-block;padding:3px 10px;border-radius:999px;font-weight:600;font-size:12.5px;
+    background:rgba(255,255,255,.06);border:1px solid var(--line)}
+  .tag.latest{background:rgba(187,134,252,.16);border-color:rgba(187,134,252,.35);color:var(--accent)}
+  .quota{height:8px;border-radius:999px;background:rgba(255,255,255,.07);overflow:hidden}
+  .quota > span{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,var(--accent),var(--accent2))}
+  footer{margin-top:26px;color:#6e6a7a;font-size:12px;text-align:center;line-height:1.6}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div class="logo">
+      <svg viewBox="0 0 32 32" role="img" aria-label="BandSync">
+        <rect width="32" height="32" rx="8" fill="#8b7cf6"/>
+        <g fill="#ffffff">
+          <rect x="7"  y="13" width="3" height="6"  rx="1.5"/>
+          <rect x="12" y="9"  width="3" height="14" rx="1.5"/>
+          <rect x="17" y="6"  width="3" height="20" rx="1.5"/>
+          <rect x="22" y="11" width="3" height="10" rx="1.5"/>
+        </g>
+      </svg>
+    </div>
+    <div class="title">
+      <h1>BandSync · Statistiche download</h1>
+      <p>Aggiornato il <span id="updated">—</span></p>
+    </div>
+    <span class="pill" id="latestPill">—</span>
+  </header>
+
+  <section class="grid cards">
+    <div class="card"><div class="ic">⬇️</div><div class="n" id="c-total">0</div><div class="l">Download totali</div></div>
+    <div class="card"><div class="ic">🏷️</div><div class="n" id="c-versions">0</div><div class="l">Versioni pubblicate</div></div>
+    <div class="card"><div class="ic">🚀</div><div class="n" id="c-latest">—</div><div class="l">Ultima versione</div></div>
+    <div class="card"><div class="ic">📈</div><div class="n" id="c-days">0</div><div class="l">Giorni di storico</div></div>
+  </section>
+
+  <section class="grid cols">
+    <div class="panel">
+      <h2>Download per versione</h2>
+      <p class="hint">Totale cumulativo di ciascuna release</p>
+      <div class="chart-box"><canvas id="byVersion"></canvas></div>
+    </div>
+    <div class="panel">
+      <h2>Distribuzione</h2>
+      <p class="hint">Quota di download per versione</p>
+      <div class="chart-box"><canvas id="donut"></canvas></div>
+    </div>
+  </section>
+
+  <section class="grid">
+    <div class="panel">
+      <h2>Andamento nel tempo</h2>
+      <p class="hint">Download totali per giorno</p>
+      <div class="chart-box"><canvas id="overTime"></canvas></div>
+      <div class="empty" id="overTimeEmpty" style="display:none">La curva si popola dai prossimi snapshot giornalieri.</div>
+    </div>
+  </section>
+
+  <section class="grid">
+    <div class="panel">
+      <h2>Classifica versioni</h2>
+      <p class="hint">Ordinate per numero di download</p>
+      <table id="rank"><thead><tr><th>Versione</th><th class="n">Download</th><th class="n">%</th><th style="width:34%">Quota</th></tr></thead><tbody></tbody></table>
+    </div>
+  </section>
+
+  <footer>
+    Fonte: GitHub Releases API · i conteggi sono cumulativi, l'andamento è ricostruito dagli snapshot giornalieri.<br>
+  </footer>
+</div>
+
+<script>
+const DATA = /*DATA*/;
+const snaps = DATA.snapshots || [];
+const css = getComputedStyle(document.documentElement);
+const ACCENT = css.getPropertyValue('--accent').trim() || '#bb86fc';
+const PALETTE = ['#bb86fc','#7c4dff','#03dac6','#ff6ec7','#ffb86c','#64b5f6','#81c784','#f06292'];
+const latest = snaps[snaps.length - 1] || { versions:{}, total:0 };
+const versions = Object.keys(latest.versions).sort(cmpVer);
+const counts = versions.map(v => latest.versions[v]);
+const total = latest.total || 0;
+
+function cmpVer(a,b){const pa=a.split('.').map(Number),pb=b.split('.').map(Number);
+  for(let i=0;i<Math.max(pa.length,pb.length);i++){const d=(pa[i]||0)-(pb[i]||0);if(d)return d;}return 0;}
+function fmt(n){return (n||0).toLocaleString('it-IT');}
+function animateCount(el,to){const t0=performance.now(),dur=700;
+  (function step(t){const k=Math.min(1,(t-t0)/dur);el.textContent=fmt(Math.round(to*easeOut(k)));
+    if(k<1)requestAnimationFrame(step);else el.textContent=fmt(to);})(t0);}
+function easeOut(x){return 1-Math.pow(1-x,3);}
+
+document.getElementById('updated').textContent = (DATA.updated_at||'—').replace('T',' ').replace(/\+.*/,' UTC');
+animateCount(document.getElementById('c-total'), total);
+document.getElementById('c-versions').textContent = versions.length;
+document.getElementById('c-latest').textContent = versions.length ? versions[versions.length-1] : '—';
+document.getElementById('c-days').textContent = snaps.length;
+document.getElementById('latestPill').textContent = versions.length ? ('ultima ' + versions[versions.length-1]) : 'nessuna release';
+
+Chart.defaults.color = css.getPropertyValue('--muted').trim() || '#9a95a6';
+Chart.defaults.borderColor = css.getPropertyValue('--line').trim() || '#2a2a3e';
+Chart.defaults.font.family = "Inter, system-ui, sans-serif";
+
+function gradient(ctx, area, c1, c2){
+  const g = ctx.createLinearGradient(0, area.top, 0, area.bottom);
+  g.addColorStop(0, c1); g.addColorStop(1, c2); return g;
+}
+
+// Barre per versione
+new Chart(document.getElementById('byVersion'), {
+  type:'bar',
+  data:{labels:versions,datasets:[{data:counts,borderRadius:8,maxBarThickness:46,
+    backgroundColor:(c)=>{const{ctx,chartArea}=c.chart;return chartArea?gradient(ctx,chartArea,'#cda5ff','#7c4dff'):ACCENT;}}]},
+  options:{plugins:{legend:{display:false}},animation:{duration:800},
+    scales:{y:{beginAtZero:true,ticks:{precision:0}},x:{grid:{display:false}}}}
+});
+
+// Ciambella distribuzione
+new Chart(document.getElementById('donut'), {
+  type:'doughnut',
+  data:{labels:versions,datasets:[{data:counts,backgroundColor:versions.map((_,i)=>PALETTE[i%PALETTE.length]),
+    borderColor:css.getPropertyValue('--panel').trim(),borderWidth:3,hoverOffset:6}]},
+  options:{cutout:'62%',plugins:{legend:{position:'bottom',labels:{boxWidth:12,boxHeight:12,padding:14}}}}
+});
+
+// Andamento nel tempo
+const otEl = document.getElementById('overTime');
+if (snaps.length >= 2){
+  new Chart(otEl,{type:'line',
+    data:{labels:snaps.map(s=>s.date),datasets:[{data:snaps.map(s=>s.total),borderColor:ACCENT,borderWidth:2.5,
+      pointRadius:3,pointBackgroundColor:ACCENT,tension:.3,fill:true,
+      backgroundColor:(c)=>{const{ctx,chartArea}=c.chart;return chartArea?gradient(ctx,chartArea,'rgba(187,134,252,.35)','rgba(187,134,252,0)'):'transparent';}}]},
+    options:{plugins:{legend:{display:false}},scales:{y:{beginAtZero:true,ticks:{precision:0}}}}});
+} else {
+  otEl.style.display='none';
+  document.getElementById('overTimeEmpty').style.display='grid';
+}
+
+// Classifica
+const tbody = document.querySelector('#rank tbody');
+const maxN = Math.max(1, ...counts);
+versions.slice().sort((a,b)=>latest.versions[b]-latest.versions[a]).forEach((v,i)=>{
+  const n = latest.versions[v], pct = total ? n/total*100 : 0, w = n/maxN*100;
+  const tr = document.createElement('tr');
+  tr.innerHTML =
+    `<td><span class="tag ${i===0?'latest':''}">${v}</span></td>`+
+    `<td class="n">${fmt(n)}</td>`+
+    `<td class="n">${pct.toFixed(1)}%</td>`+
+    `<td><div class="quota"><span style="width:${Math.max(w,2)}%"></span></div></td>`;
+  tbody.appendChild(tr);
+});
+</script>
+</body>
+</html>
+"""
+
+
+def main():
+    try:
+        releases = fetch_releases()
+    except Exception as e:  # noqa: BLE001
+        print(f"Errore nel recupero delle release: {e}", file=sys.stderr)
+        return 1
+    per_version = collect(releases)
+    history = update_history(load_history(), per_version)
+    STATS.write_text(json.dumps(history, ensure_ascii=False, indent=2) + "\n")
+    INDEX.write_text(render_html(history))
+    print(f"Versioni: {len(per_version)} | totale download: {sum(per_version.values())} | "
+          f"snapshot: {len(history['snapshots'])}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
